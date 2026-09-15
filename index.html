@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>药盒 WebAR 图片追踪 Demo</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+  #camera,#overlay{position:fixed;inset:0;width:100%;height:100%;object-fit:cover}
+  #camera{z-index:0;background:#111}
+  #overlay{z-index:1;pointer-events:none}
+  #ui{position:fixed;z-index:5;left:16px;right:16px;top:max(16px,env(safe-area-inset-top));color:#fff}
+  .panel{background:rgba(0,0,0,.55);backdrop-filter:blur(10px);border-radius:16px;padding:12px 14px}
+  #status{font-size:15px;font-weight:600}
+  #hint{font-size:12px;opacity:.82;margin-top:5px;line-height:1.45}
+  button{margin-top:10px;border:0;border-radius:999px;padding:10px 16px;background:#fff;color:#111;font-weight:700}
+  #debug{position:fixed;z-index:6;bottom:max(12px,env(safe-area-inset-bottom));left:12px;color:#fff;background:rgba(0,0,0,.45);padding:7px 9px;border-radius:10px;font-size:11px;display:none}
+  #targetPreview{position:fixed;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:6;width:92px;border-radius:10px;opacity:.8;border:1px solid rgba(255,255,255,.5);display:none}
+</style>
+</head>
+<body>
+<video id="camera" autoplay playsinline muted></video>
+<canvas id="overlay"></canvas>
+
+<div id="ui">
+  <div class="panel">
+    <div id="status">正在加载视觉追踪引擎…</div>
+    <div id="hint">允许摄像头后，把药盒顶部完整放进画面。这个版本先把图片“贴”到药盒顶面，移动/旋转药盒时图片会跟着变形。</div>
+    <button id="start">启动摄像头</button>
+  </div>
+</div>
+<div id="debug"></div>
+<img id="targetPreview" src="target.jpg">
+
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<script>
+const video = document.getElementById('camera');
+const canvas = document.getElementById('overlay');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const hintEl = document.getElementById('hint');
+const startBtn = document.getElementById('start');
+const debugEl = document.getElementById('debug');
+const targetPreview = document.getElementById('targetPreview');
+
+const targetImg = new Image();
+const arImg = new Image();
+targetImg.src = 'target.jpg';
+arImg.src = 'ar-content.jpg';
+
+let cap, targetGray, orb, targetKp, targetDesc, matcher;
+let running = false;
+let lastGood = 0;
+let frameCount = 0;
+let lastLog = 0;
+
+function setStatus(s){ statusEl.textContent = s; }
+
+function resizeCanvas(){
+  canvas.width = video.videoWidth || innerWidth;
+  canvas.height = video.videoHeight || innerHeight;
+}
+addEventListener('resize', resizeCanvas);
+
+function matFromImage(img){
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth; c.height = img.naturalHeight;
+  c.getContext('2d').drawImage(img,0,0);
+  return cv.imread(c);
+}
+
+function initTracker(){
+  const target = matFromImage(targetImg);
+  targetGray = new cv.Mat();
+  cv.cvtColor(target,targetGray,cv.COLOR_RGBA2GRAY);
+
+  orb = new cv.ORB(800);
+  targetKp = new cv.KeyPointVector();
+  targetDesc = new cv.Mat();
+  orb.detectAndCompute(targetGray, new cv.Mat(), targetKp, targetDesc);
+
+  matcher = new cv.BFMatcher(cv.NORM_HAMMING, false);
+
+  target.delete();
+  setStatus(`追踪已准备：目标特征点 ${targetKp.size()} 个`);
+}
+
+async function startCamera(){
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video:{
+        facingMode:{ideal:'environment'},
+        width:{ideal:1280},
+        height:{ideal:720}
+      },
+      audio:false
+    });
+    video.srcObject = stream;
+    await video.play();
+    resizeCanvas();
+    running = true;
+    startBtn.style.display='none';
+    targetPreview.style.display='block';
+    setStatus('正在寻找药盒…');
+    requestAnimationFrame(loop);
+  }catch(e){
+    setStatus('无法打开摄像头');
+    hintEl.textContent = '请在 HTTPS 页面中打开，并允许浏览器使用摄像头。';
+    console.error(e);
+  }
+}
+
+function drawWarp(H, frameW, frameH){
+  // Resize AR content to the same coordinate system as the target image.
+  const src = cv.imread(arImg);
+  const dst = new cv.Mat();
+  const dsize = new cv.Size(frameW, frameH);
+  cv.warpPerspective(src, dst, H, dsize, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(0,0,0,0));
+
+  // Give the result a little transparency so the physical box remains visible.
+  const rgba = new cv.MatVector();
+  cv.split(dst, rgba);
+  if(rgba.size() === 4){
+    // Keep original alpha but cap RGB visibility via canvas globalAlpha below.
+  }
+
+  // cv.imshow cannot preserve a transparent overlay reliably across all builds,
+  // so render it into a temporary canvas and then composite it.
+  const tmp = document.createElement('canvas');
+  tmp.width = frameW; tmp.height = frameH;
+  cv.imshow(tmp, dst);
+  ctx.save();
+  ctx.globalAlpha = 0.88;
+  ctx.drawImage(tmp,0,0,canvas.width,canvas.height);
+  ctx.restore();
+
+  rgba.delete(); src.delete(); dst.delete();
+}
+
+function processFrame(){
+  if(video.readyState < 2) return;
+  const W = canvas.width, Hh = canvas.height;
+
+  // Work at a smaller resolution for phone performance.
+  const workW = 640;
+  const scale = workW / W;
+  const workH = Math.max(1, Math.round(Hh * scale));
+
+  const work = document.createElement('canvas');
+  work.width=workW; work.height=workH;
+  work.getContext('2d').drawImage(video,0,0,workW,workH);
+
+  let frame = cv.imread(work);
+  let gray = new cv.Mat();
+  cv.cvtColor(frame,gray,cv.COLOR_RGBA2GRAY);
+
+  let kp = new cv.KeyPointVector();
+  let desc = new cv.Mat();
+  orb.detectAndCompute(gray,new cv.Mat(),kp,desc);
+
+  if(desc.rows > 0 && targetDesc.rows > 0){
+    const knn = new cv.DMatchVectorVector();
+    matcher.knnMatch(targetDesc,desc,knn,2);
+
+    const good=[];
+    for(let i=0;i<knn.size();i++){
+      const m=knn.get(i);
+      if(m.size()>=2){
+        const a=m.get(0), b=m.get(1);
+        if(a.distance < 0.72*b.distance) good.push(a);
+      }
+    }
+
+    if(good.length >= 10){
+      const srcPts=[], dstPts=[];
+      for(const m of good){
+        const p1=targetKp.get(m.queryIdx).pt;
+        const p2=kp.get(m.trainIdx).pt;
+        srcPts.push(p1.x,p1.y);
+        dstPts.push(p2.x/scale,p2.y/scale);
+      }
+
+      const srcMat=cv.matFromArray(good.length,2,cv.CV_32F,srcPts);
+      const dstMat=cv.matFromArray(good.length,2,cv.CV_32F,dstPts);
+      const mask=new cv.Mat();
+      const hom=cv.findHomography(srcMat,dstMat,cv.RANSAC,5,mask);
+
+      if(!hom.empty()){
+        let inliers=0;
+        for(let i=0;i<mask.rows;i++) if(mask.data[i]) inliers++;
+        if(inliers>=8){
+          // Map AR image onto the tracked target.
+          const ar = cv.imread(arImg);
+          const out = new cv.Mat();
+          cv.warpPerspective(ar,out,hom,new cv.Size(W,Hh),cv.INTER_LINEAR,cv.BORDER_CONSTANT,new cv.Scalar(0,0,0,0));
+
+          const tmp=document.createElement('canvas');
+          tmp.width=W; tmp.height=Hh;
+          cv.imshow(tmp,out);
+          ctx.save();
+          ctx.globalAlpha=.86;
+          ctx.drawImage(tmp,0,0);
+          ctx.restore();
+
+          ar.delete(); out.delete();
+          lastGood=performance.now();
+          setStatus(`已识别药盒 · ${inliers} 个稳定匹配点`);
+        }
+      }
+      srcMat.delete(); dstMat.delete(); mask.delete(); hom.delete();
+    }
+    knn.delete();
+  }
+
+  kp.delete(); desc.delete(); gray.delete(); frame.delete();
+
+  if(performance.now()-lastGood>900){
+    setStatus('正在寻找药盒…');
+  }
+}
+
+function loop(){
+  if(!running) return;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  frameCount++;
+  // Limit processing to roughly 12–15 FPS.
+  if(frameCount%2===0) processFrame();
+  requestAnimationFrame(loop);
+}
+
+function waitForCV(){
+  if(typeof cv !== 'undefined' && cv.Mat){
+    cv['onRuntimeInitialized']=()=>{
+      initTracker();
+      setStatus('视觉追踪引擎已加载');
+    };
+    // Some builds are already initialized.
+    setTimeout(()=>{
+      if(!targetDesc) {
+        try{ initTracker(); }catch(e){ console.error(e); }
+      }
+    },800);
+  }else{
+    setTimeout(waitForCV,300);
+  }
+}
+
+startBtn.addEventListener('click',startCamera);
+Promise.all([
+  new Promise(r=>targetImg.onload=r),
+  new Promise(r=>arImg.onload=r)
+]).then(waitForCV);
+</script>
+</body>
+</html>
