@@ -41,7 +41,6 @@ const ctx = canvas.getContext('2d');
 const statusEl = document.getElementById('status');
 const hintEl = document.getElementById('hint');
 const startBtn = document.getElementById('start');
-const debugEl = document.getElementById('debug');
 const targetPreview = document.getElementById('targetPreview');
 
 const targetImg = new Image();
@@ -49,11 +48,23 @@ const arImg = new Image();
 targetImg.src = 'target.jpg';
 arImg.src = 'ar-content.jpg';
 
-let cap, targetGray, orb, targetKp, targetDesc, matcher;
+let orb, targetGray, targetKp, targetDesc, matcher;
+let arMat = null;          // AR content resized into target.jpg's own pixel space
+let srcCornersMat = null;  // the 4 corners of target.jpg, in its own pixel space
+let targetW = 0, targetH = 0;
+
 let running = false;
-let lastGood = 0;
 let frameCount = 0;
-let lastLog = 0;
+
+// ---- stability state ----
+// Instead of drawing a brand-new (and slightly different) homography every
+// single frame, we smooth the 4 corner points of the tracked quad over
+// time, and keep showing the last known pose for a short grace period if
+// a frame briefly fails to match. That's what removes the flicker.
+let smoothCorners = null;  // Float32Array/Array(8): x0,y0,x1,y1,x2,y2,x3,y3
+let lastSeenAt = 0;
+const HOLD_MS = 500;       // keep showing the last good pose for up to this long
+const SMOOTH = 0.35;       // 0..1 — lower = smoother but laggier, higher = snappier but jitterier
 
 function setStatus(s){ statusEl.textContent = s; }
 
@@ -72,15 +83,33 @@ function matFromImage(img){
 
 function initTracker(){
   const target = matFromImage(targetImg);
+  targetW = target.cols; targetH = target.rows;
+
   targetGray = new cv.Mat();
   cv.cvtColor(target,targetGray,cv.COLOR_RGBA2GRAY);
 
-  orb = new cv.ORB(800);
+  orb = new cv.ORB(1000, 1.2, 10);
   targetKp = new cv.KeyPointVector();
   targetDesc = new cv.Mat();
   orb.detectAndCompute(targetGray, new cv.Mat(), targetKp, targetDesc);
 
   matcher = new cv.BFMatcher(cv.NORM_HAMMING, false);
+
+  srcCornersMat = cv.matFromArray(4,1,cv.CV_32FC2, [
+    0,0,  targetW,0,  targetW,targetH,  0,targetH
+  ]);
+
+  // IMPORTANT: the homography we compute lives in target.jpg's own pixel
+  // space (0..targetW, 0..targetH). ar-content.jpg is a *different* size
+  // (1200x900 vs target.jpg's 1152x340), so if we warp it with that
+  // homography directly, warpPerspective samples the wrong region of it —
+  // the overlay comes out cropped/misaligned, and that misalignment shifts
+  // a little every frame as the pose changes, which reads as "flicker".
+  // Resizing it once into target.jpg's coordinate space fixes that.
+  const arRaw = matFromImage(arImg);
+  arMat = new cv.Mat();
+  cv.resize(arRaw, arMat, new cv.Size(targetW, targetH));
+  arRaw.delete();
 
   target.delete();
   setStatus(`追踪已准备：目标特征点 ${targetKp.size()} 个`);
@@ -111,36 +140,10 @@ async function startCamera(){
   }
 }
 
-function drawWarp(H, frameW, frameH){
-  // Resize AR content to the same coordinate system as the target image.
-  const src = cv.imread(arImg);
-  const dst = new cv.Mat();
-  const dsize = new cv.Size(frameW, frameH);
-  cv.warpPerspective(src, dst, H, dsize, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(0,0,0,0));
-
-  // Give the result a little transparency so the physical box remains visible.
-  const rgba = new cv.MatVector();
-  cv.split(dst, rgba);
-  if(rgba.size() === 4){
-    // Keep original alpha but cap RGB visibility via canvas globalAlpha below.
-  }
-
-  // cv.imshow cannot preserve a transparent overlay reliably across all builds,
-  // so render it into a temporary canvas and then composite it.
-  const tmp = document.createElement('canvas');
-  tmp.width = frameW; tmp.height = frameH;
-  cv.imshow(tmp, dst);
-  ctx.save();
-  ctx.globalAlpha = 0.88;
-  ctx.drawImage(tmp,0,0,canvas.width,canvas.height);
-  ctx.restore();
-
-  rgba.delete(); src.delete(); dst.delete();
-}
-
 function processFrame(){
   if(video.readyState < 2) return;
   const W = canvas.width, Hh = canvas.height;
+  const now = performance.now();
 
   // Work at a smaller resolution for phone performance.
   const workW = 640;
@@ -159,6 +162,8 @@ function processFrame(){
   let desc = new cv.Mat();
   orb.detectAndCompute(gray,new cv.Mat(),kp,desc);
 
+  let inliers = 0;
+
   if(desc.rows > 0 && targetDesc.rows > 0){
     const knn = new cv.DMatchVectorVector();
     matcher.knnMatch(targetDesc,desc,knn,2);
@@ -168,11 +173,11 @@ function processFrame(){
       const m=knn.get(i);
       if(m.size()>=2){
         const a=m.get(0), b=m.get(1);
-        if(a.distance < 0.72*b.distance) good.push(a);
+        if(a.distance < 0.75*b.distance) good.push(a);
       }
     }
 
-    if(good.length >= 10){
+    if(good.length >= 12){
       const srcPts=[], dstPts=[];
       for(const m of good){
         const p1=targetKp.get(m.queryIdx).pt;
@@ -187,25 +192,21 @@ function processFrame(){
       const hom=cv.findHomography(srcMat,dstMat,cv.RANSAC,5,mask);
 
       if(!hom.empty()){
-        let inliers=0;
         for(let i=0;i<mask.rows;i++) if(mask.data[i]) inliers++;
-        if(inliers>=8){
-          // Map AR image onto the tracked target.
-          const ar = cv.imread(arImg);
-          const out = new cv.Mat();
-          cv.warpPerspective(ar,out,hom,new cv.Size(W,Hh),cv.INTER_LINEAR,cv.BORDER_CONSTANT,new cv.Scalar(0,0,0,0));
-
-          const tmp=document.createElement('canvas');
-          tmp.width=W; tmp.height=Hh;
-          cv.imshow(tmp,out);
-          ctx.save();
-          ctx.globalAlpha=.86;
-          ctx.drawImage(tmp,0,0);
-          ctx.restore();
-
-          ar.delete(); out.delete();
-          lastGood=performance.now();
-          setStatus(`已识别药盒 · ${inliers} 个稳定匹配点`);
+        if(inliers>=10){
+          // Map the target's 4 corners through this frame's homography to
+          // find out where the box currently sits, then blend that into
+          // the running smoothed estimate instead of jumping straight to it.
+          const cornersOut = new cv.Mat();
+          cv.perspectiveTransform(srcCornersMat, cornersOut, hom);
+          const q = cornersOut.data32F;
+          if(!smoothCorners){
+            smoothCorners = Array.from(q);
+          } else {
+            for(let i=0;i<8;i++) smoothCorners[i] = SMOOTH*q[i] + (1-SMOOTH)*smoothCorners[i];
+          }
+          lastSeenAt = now;
+          cornersOut.delete();
         }
       }
       srcMat.delete(); dstMat.delete(); mask.delete(); hom.delete();
@@ -215,16 +216,51 @@ function processFrame(){
 
   kp.delete(); desc.delete(); gray.delete(); frame.delete();
 
-  if(performance.now()-lastGood>900){
+  // Only touch the canvas right before we redraw — never clear-and-leave-
+  // blank on frames where detection is skipped or briefly fails. That was
+  // the main source of the on/off blinking.
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if(smoothCorners){
+    const sinceSeen = now - lastSeenAt;
+
+    if(sinceSeen > HOLD_MS){
+      // Lost it for too long — stop showing a stale, no-longer-true pose.
+      smoothCorners = null;
+      setStatus('正在寻找药盒…');
+    } else {
+      const dstCornersMat = cv.matFromArray(4,1,cv.CV_32FC2, smoothCorners);
+      const M = cv.getPerspectiveTransform(srcCornersMat, dstCornersMat);
+      const out = new cv.Mat();
+      cv.warpPerspective(arMat, out, M, new cv.Size(W,Hh), cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(0,0,0,0));
+
+      const tmp = document.createElement('canvas');
+      tmp.width=W; tmp.height=Hh;
+      cv.imshow(tmp, out);
+
+      // Fade out gently instead of popping off if we're coasting on a held pose.
+      const alpha = 0.86 * (1 - Math.max(0, sinceSeen-50)/HOLD_MS);
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, alpha);
+      ctx.drawImage(tmp,0,0);
+      ctx.restore();
+
+      setStatus(sinceSeen < 50 ? `已识别药盒 · ${inliers} 个稳定匹配点` : '追踪中…');
+
+      dstCornersMat.delete(); M.delete(); out.delete();
+    }
+  } else {
     setStatus('正在寻找药盒…');
   }
 }
 
 function loop(){
   if(!running) return;
-  ctx.clearRect(0,0,canvas.width,canvas.height);
   frameCount++;
-  // Limit processing to roughly 12–15 FPS.
+  // Limit heavy detection to roughly every other frame for phone
+  // performance. The canvas is only cleared/redrawn inside processFrame
+  // itself, so the overlay stays put on the frames in between instead of
+  // blinking out.
   if(frameCount%2===0) processFrame();
   requestAnimationFrame(loop);
 }
